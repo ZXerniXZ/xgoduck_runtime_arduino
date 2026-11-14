@@ -65,7 +65,7 @@ class Controller:
         self.model_message += '; ' + message
         self.roller_mode = False
         self.getup_policy = Policy()
-        ok, message = self.getup_policy.load('xgoduck_getup.onnx')
+        ok, message = self.getup_policy.load('xgoduck_getup.onnx', use_model_home=True)
         if not ok:
             raise RuntimeError(message)
         self.model_message += '; ' + message
@@ -1225,7 +1225,11 @@ class Controller:
                 acquired = time.monotonic()
                 if reset_policy:
                     selected.reset_action_filter()
-                action = selected.infer(filt['grav'], filt['gyro_rad'], filt['angles_deg'], filt['vels_deg'], twist, head)
+                gyro = filt['gyro_rad']
+                if selected is self.getup_policy:  # hd1910: clip giroscopio rialzo
+                    # come in allenamento (MPU-6000 a ±250 °/s): ±4.3633 rad/s
+                    gyro = [max(-4.3633, min(4.3633, float(v))) for v in gyro]
+                action = selected.infer(filt['grav'], gyro, filt['angles_deg'], filt['vels_deg'], twist, head)
                 target = selected.action_to_deg(action)
             finish = time.monotonic()
             with self.lock:
