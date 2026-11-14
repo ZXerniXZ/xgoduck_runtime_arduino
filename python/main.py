@@ -59,6 +59,18 @@ def action_scale(body: dict):
     try: return controller.set_action_scale(**body)
     except (TypeError, ValueError) as exc: raise HTTPException(400, str(exc))
 
+def stance(body: dict):
+    try:
+        if body.get('reset'):
+            return controller.reset_stance()
+        if body.get('capture'):
+            return controller.capture_stance_gravity()
+        if 'home_deg' not in body:
+            raise ValueError('standing pose needs 14 joint degrees')
+        return controller.set_stance(body['home_deg'])
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc))
+
 def pick(_body: dict = None):
     try: return controller.start_pick()
     except ValueError as exc: raise HTTPException(400, str(exc))
@@ -91,6 +103,10 @@ def cal_heartbeat(_body: dict = None):
     try: return controller.cal_heartbeat()
     except ValueError as exc: raise HTTPException(400, str(exc))
 
+def cal_goto(body: dict):
+    try: return controller.cal_goto(body['index'], body['raw_pos'])
+    except (KeyError, TypeError, ValueError) as exc: raise HTTPException(400, str(exc))
+
 def cal_center(body: dict):
     try: return controller.cal_center(body['index'])
     except (KeyError, TypeError, ValueError) as exc: raise HTTPException(400, str(exc))
@@ -108,7 +124,8 @@ def servo_action(body: dict):
         return controller.servo_op(
             body['action'], body.get('target_id'),
             new_id=body.get('new_id'), kp=body.get('kp', 5), kd=body.get('kd', 20),
-            protection_enabled=body.get('protection_enabled', True), current_a=body.get('current_a', 1.0))
+            protection_enabled=body.get('protection_enabled', True), current_a=body.get('current_a', 1.0),
+            raw_pos=body.get('raw_pos'))
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(400, str(exc))
 
@@ -121,6 +138,7 @@ ui.expose_api('POST', '/api/filter', filtering)
 ui.expose_api('POST', '/api/imu-filter', imu_filtering)
 ui.expose_api('POST', '/api/imu-calibration', imu_calibration)
 ui.expose_api('POST', '/api/action-scale', action_scale)
+ui.expose_api('POST', '/api/stance', stance)
 ui.expose_api('POST', '/api/pick', pick)
 ui.expose_api('POST', '/api/roulade', roulade)
 ui.expose_api('GET', '/api/roulade-timing', controller.roulade_timing)
@@ -130,6 +148,7 @@ ui.expose_api('POST', '/api/left_kick', left_kick)
 ui.expose_api('POST', '/api/cal/enter', cal_enter)
 ui.expose_api('POST', '/api/cal/exit', cal_exit)
 ui.expose_api('POST', '/api/cal/heartbeat', cal_heartbeat)
+ui.expose_api('POST', '/api/cal/goto', cal_goto)
 ui.expose_api('POST', '/api/cal/center', cal_center)
 ui.expose_api('POST', '/api/servo/enter', servo_enter)
 ui.expose_api('POST', '/api/servo/exit', servo_exit)

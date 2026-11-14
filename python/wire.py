@@ -19,14 +19,14 @@ DISARM, ARM, POLICY, HOLD = range(4)
 CAL_ENTER, CAL_EXIT, CAL_CENTER_ONE = range(3)
 SERVO_CENTER_POS = 2047
 CAL_HOLD_POS = 2048
-SERVO_ENTER, SERVO_EXIT, SERVO_UNLOCK, SERVO_SET_ID = range(4)
+SERVO_ENTER, SERVO_EXIT, SERVO_UNLOCK, SERVO_SET_ID, SERVO_GOTO = range(5)
 SERVO_SET_PERM_KP_KD, SERVO_READ, SERVO_PING, SERVO_RESET_MID = range(5, 9)
 SERVO_SET_PROTECTION = 9
 SERVO_SET_PROTECTION_CURRENT = 10
 BROADCAST_ID = 254
 PROTECTION_CURRENT_UNIT_A = 0.0065
 PROTECTION_DISABLED, PROTECTION_ENABLED = 0x04, 0x0D
-SERVO_OPS = (SERVO_ENTER, SERVO_EXIT, SERVO_UNLOCK, SERVO_SET_ID,
+SERVO_OPS = (SERVO_ENTER, SERVO_EXIT, SERVO_UNLOCK, SERVO_SET_ID, SERVO_GOTO,
              SERVO_SET_PERM_KP_KD, SERVO_READ, SERVO_PING, SERVO_RESET_MID,
              SERVO_SET_PROTECTION, SERVO_SET_PROTECTION_CURRENT)
 
@@ -136,7 +136,7 @@ def decode_cal_reply(data):
         raise ValueError('invalid calibration reply ABI')
     return {'seq': seq, 'index': index, 'ok': bool(ok)}
 
-def encode_servo(op, target_id, new_id=0, kp=5, kd=20, *, protection_flags=0, protection_current_raw=0):
+def encode_servo(op, target_id, new_id=0, kp=5, kd=20, *, protection_flags=0, protection_current_raw=0, raw_pos=0):
     if op not in SERVO_OPS:
         raise ValueError('invalid servo op')
     if op in (SERVO_SET_PROTECTION, SERVO_SET_PROTECTION_CURRENT):
@@ -153,6 +153,10 @@ def encode_servo(op, target_id, new_id=0, kp=5, kd=20, *, protection_flags=0, pr
         return SERVO.pack(b'DQV2', op, BROADCAST_ID, 0, 0, 0, protection_flags, protection_current_raw)
     if not 0 <= int(target_id) <= 253:
         raise ValueError('invalid target id')
+    if op == SERVO_GOTO:
+        if isinstance(raw_pos, bool) or not isinstance(raw_pos, int) or not 0 <= raw_pos <= 4095:
+            raise ValueError('raw position out of range')
+        return SERVO.pack(b'DQV2', SERVO_GOTO, int(target_id) & 0xff, 0, 0, 0, 0, raw_pos)
     if op == SERVO_SET_ID and not 0 <= int(new_id) <= 253:
         raise ValueError('invalid new id')
     return SERVO.pack(b'DQV2', op, int(target_id) & 0xff, int(new_id) & 0xff,

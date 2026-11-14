@@ -11,8 +11,12 @@ from heading import HeadingHold
 from standing_imu import (CALIBRATION_PATH, SAMPLE_SECONDS, ImuCorrection,
                           check_standing, estimate as estimate_imu, load as load_imu,
                           save as save_imu, disable as disable_imu)
+from pathlib import Path
+from stance import (JOINTS as STANCE_JOINTS, STANCE_LIMIT_DEG, STANCE_PATH,
+                    CAPTURE_SECONDS, bias_from_gravity, baseline_bias, baseline_home,
+                    load as load_stance, parse_home, save as save_stance)
 from rl_core import (MOTOR_IDS, POLICY_IDS, IMU_BIAS_DEG, MOUTH_INDEX, MOUTH_MAX_DEG,
-                     ROLLER_LEG_DEFAULT_DEG)
+                     ROLLER_LEG_DEFAULT_DEG, set_imu_bias)
 from wire import *
 
 EXCLUSIVE_MODES = ('calibrate', 'servo_debug')
@@ -31,7 +35,7 @@ COMMAND_ACC_X_BIAS_MS2 = 1.5  # Temporary IMU trim magnitude; set to 0 to disabl
 VOLTAGE_TIMEOUT_S = 3.0
 
 class Controller:
-    def __init__(self, bridge, *, imu_calibration_path=None):
+    def __init__(self, bridge, *, imu_calibration_path=None, stance_path=None):
         self.bridge = bridge
         self.lock = threading.RLock()
         self.servo_op_lock = threading.Lock()
@@ -43,6 +47,10 @@ class Controller:
             raise RuntimeError(message)
         self.model_message = message
         self.walk_policy = self.policy
+        self._stance_path = STANCE_PATH if stance_path is None else Path(stance_path)
+        self._stance_message = ''
+        self._stance_capturing = False
+        self._load_saved_stance()
         self.roller_policy = Policy()
         ok, message = self.roller_policy.load('xgoduck_roller.onnx', use_model_home=True)
         if not ok:
@@ -410,6 +418,142 @@ class Controller:
             self._imu_job = dict(state='idle', active=False, progress=0., samples=0,
                                  message='IMU calibration reset. Previous calibration backed up.')
             return self._imu_status_locked()
+
+    def _load_saved_stance(self):
+        try:
+            record = load_stance(self._stance_path)
+        except (OSError, ValueError, TypeError, KeyError):
+            self._stance_message = 'Saved stance could not be loaded. Original pose kept.'
+            return
+        if record is None:
+            self.walk_policy.home_deg[:] = baseline_home()
+            set_imu_bias(*baseline_bias())
+            self._stance_message = 'Measured standing pose applied.'
+            return
+        self.walk_policy.home_deg[:] = record['home_deg']
+        if record['imu_bias_deg'] is not None:
+            set_imu_bias(*record['imu_bias_deg'])
+        self._stance_message = 'Saved standing pose loaded.'
+
+    def _stance_status_locked(self):
+        return dict(
+            home_deg=[float(v) for v in self.walk_policy.home_deg],
+            imu_bias_deg=[float(v) for v in IMU_BIAS_DEG],
+            saved=self._stance_path.exists(),
+            limit_deg=STANCE_LIMIT_DEG,
+            joints=[dict(id=motor_id, name=name) for motor_id, name in STANCE_JOINTS],
+            message=self._stance_message)
+
+    def _reject_stance_change_locked(self):
+        if self._stance_capturing:
+            raise ValueError('Wait for the gravity capture to finish.')
+        if self._imu_job['active']:
+            raise ValueError('Wait for IMU calibration to finish.')
+        if self.roller_mode:
+            raise ValueError('Turn Skating mode off before changing the standing pose.')
+        if self.mode == 'policy':
+            raise ValueError('Leave Walk before changing the standing pose.')
+        if self.mode in EXCLUSIVE_MODES:
+            raise ValueError('Leave calibration before changing the standing pose.')
+        if (self.action_preparation or self.pick_active or self._roulade_on(time.monotonic())
+                or self.sitstand_phase != 'idle' or self.kick_until):
+            raise ValueError('Wait for the current action to finish.')
+
+    def _write_stance_locked(self):
+        try:
+            save_stance(self._stance_path, self.walk_policy.home_deg, IMU_BIAS_DEG)
+        except OSError as exc:
+            raise ValueError('Could not save the standing pose.') from exc
+
+    def set_stance(self, home_deg):
+        home = parse_home(home_deg)
+        with self.lock:
+            self._reject_stance_change_locked()
+            previous = [float(v) for v in self.walk_policy.home_deg]
+            with self.policy_lock:
+                self.walk_policy.home_deg[:] = home
+                self.walk_policy.reset_action_filter()
+            self.policy_needs_reset = True
+            try:
+                self._write_stance_locked()
+            except ValueError:
+                with self.policy_lock:
+                    self.walk_policy.home_deg[:] = previous
+                raise
+            self._stance_message = 'Standing pose saved.'
+            return self._stance_status_locked()
+
+    def reset_stance(self):
+        with self.lock:
+            self._reject_stance_change_locked()
+            previous = self.walk_policy.home_deg.copy()
+            previous_bias = tuple(IMU_BIAS_DEG)
+            with self.policy_lock:
+                self.walk_policy.home_deg[:] = baseline_home()
+                self.walk_policy.reset_action_filter()
+            set_imu_bias(*baseline_bias())
+            self.filter.reset()
+            self.filtered = None
+            self.policy_needs_reset = True
+            self.recovery.reset()
+            try:
+                self._write_stance_locked()
+            except ValueError:
+                with self.policy_lock:
+                    self.walk_policy.home_deg[:] = previous
+                IMU_BIAS_DEG[:] = previous_bias
+                raise
+            self._stance_message = 'Standing pose reset to the measured stance.'
+            return self._stance_status_locked()
+
+    def capture_stance_gravity(self):
+        with self.lock:
+            self._reject_stance_change_locked()
+            if self.mode != 'hold':
+                raise ValueError('Hold Default pose and keep the body still, then capture gravity.')
+            fb = self._require_feedback(0)
+            if elapsed_us(fb.sample_us, fb.imu_us) / 1e6 > IMU_STALE_S:
+                raise ValueError('IMU readings are stale. Check the connection and try again.')
+            if not self.filtered or not self.filtered.get('imu_fusion_ready'):
+                raise ValueError('Gravity is not ready. Hold Default pose still and try again.')
+            generation = self.generation
+            self._stance_capturing = True
+        samples = []
+        try:
+            deadline = time.monotonic() + CAPTURE_SECONDS
+            while time.monotonic() < deadline:
+                if self.stop_event.wait(0.02):
+                    raise ValueError('Capture cancelled because the app stopped.')
+                with self.lock:
+                    if generation != self.generation or self.mode != 'hold':
+                        raise ValueError('Capture cancelled because the control mode changed.')
+                    fb = self.feedback
+                    if (not fb or time.monotonic() - self.rx_time > .15 or not fb.imu_ok
+                            or elapsed_us(fb.sample_us, fb.imu_us) / 1e6 > IMU_STALE_S):
+                        raise ValueError('IMU readings were interrupted. Try again.')
+                    filt = self.filtered
+                    if filt and filt.get('imu_fusion_ready'):
+                        samples.append((list(filt['grav']), list(filt['gyro_rad'])))
+            roll, pitch, yaw = bias_from_gravity(samples)
+            with self.lock:
+                if generation != self.generation or self.mode != 'hold':
+                    raise ValueError('Capture cancelled because the control mode changed.')
+                previous_bias = tuple(IMU_BIAS_DEG)
+                set_imu_bias(roll, pitch, yaw)
+                try:
+                    self._write_stance_locked()
+                except ValueError:
+                    IMU_BIAS_DEG[:] = previous_bias
+                    raise
+                self.filter.reset()
+                self.filtered = None
+                self.policy_needs_reset = True
+                self.recovery.reset()
+                self._stance_message = 'Gravity reference captured for this pose.'
+                return self._stance_status_locked()
+        finally:
+            with self.lock:
+                self._stance_capturing = False
 
     def set_mode(self, mode):
         if mode not in ('shadow', 'off', 'hold', 'policy', 'calibrate', 'servo_debug'):
@@ -825,6 +969,29 @@ class Controller:
             self.web_time = time.monotonic()
         return {'ok': True}
 
+    def cal_goto(self, index, raw_pos):
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < 15:
+            raise ValueError('joint index out of range')
+        if isinstance(raw_pos, bool) or not isinstance(raw_pos, int) or not 0 <= raw_pos <= 4095:
+            raise ValueError('raw position out of range')
+        target = MOTOR_IDS[index]
+        with self.servo_op_lock:
+            with self.lock:
+                if self.mode != 'calibrate':
+                    raise ValueError('not in calibrate mode')
+                if self.cal_done[index]:
+                    raise ValueError('unload the joint before moving it')
+                self.web_time = time.monotonic()
+                self.servo_reply_event.clear()
+                self.servo_reply = None
+                self.servo_expected_reply = (SERVO_GOTO, target)
+            try:
+                self.bridge.notify('duck_servo', encode_servo(SERVO_GOTO, target, raw_pos=raw_pos))
+                return self._wait_servo_reply(SERVO_GOTO, target_id=target)
+            finally:
+                with self.lock:
+                    self.servo_expected_reply = None
+
     def cal_center(self, index):
         if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < 15:
             raise ValueError('joint index out of range')
@@ -862,11 +1029,11 @@ class Controller:
             raise ValueError('not in servo_debug mode')
         self.web_time = time.monotonic()
 
-    def servo_op(self, action, target_id=None, new_id=None, kp=5, kd=20, *, protection_enabled=True, current_a=1.0):
+    def servo_op(self, action, target_id=None, new_id=None, kp=5, kd=20, *, protection_enabled=True, current_a=1.0, raw_pos=None):
         with self.servo_op_lock:
             if action != 'set_id':
                 return self._servo_op(action, target_id, new_id, kp, kd,
-                                      protection_enabled=protection_enabled, current_a=current_a)
+                                      protection_enabled=protection_enabled, current_a=current_a, raw_pos=raw_pos)
             target_id, new_id = int(target_id), int(new_id)
             if not 0 <= target_id <= 253 or not 0 <= new_id <= 253:
                 raise ValueError('ID must be between 0 and 253')
@@ -877,7 +1044,7 @@ class Controller:
             if self._servo_op('ping', new_id)['ok']:
                 raise ValueError(f'ID {new_id} is already in use; choose another ID')
             # Keep the checks, write and verification in one serialized operation.
-            reply = self._servo_op(action, target_id, new_id, kp, kd)
+            reply = self._servo_op(action, target_id, new_id, kp, kd, raw_pos=raw_pos)
             time.sleep(0.05)
             if not self._servo_op('ping', new_id)['ok']:
                 raise ValueError(f'ID write sent, but ID {new_id} did not reply. Scan again')
@@ -885,7 +1052,7 @@ class Controller:
                 raise ValueError('Both old and new IDs replied. Connect only one servo and scan again')
             return dict(reply, new_id=new_id)
 
-    def _servo_op(self, action, target_id, new_id=None, kp=5, kd=20, *, protection_enabled=True, current_a=1.0):
+    def _servo_op(self, action, target_id, new_id=None, kp=5, kd=20, *, protection_enabled=True, current_a=1.0, raw_pos=None):
         if action in ('set_protection', 'set_protection_current'):
             if target_id is not None and target_id != BROADCAST_ID:
                 raise ValueError('protection applies to all servos; target must be broadcast')
@@ -901,6 +1068,10 @@ class Controller:
                 if not 0 <= new_id <= 253:
                     raise ValueError('invalid new id')
                 op, payload = SERVO_SET_ID, encode_servo(SERVO_SET_ID, target_id, new_id=new_id)
+            elif action == 'goto':
+                if isinstance(raw_pos, bool) or not isinstance(raw_pos, int) or not 0 <= raw_pos <= 4095:
+                    raise ValueError('raw position out of range')
+                op, payload = SERVO_GOTO, encode_servo(SERVO_GOTO, target_id, raw_pos=raw_pos)
             elif action == 'reset_mid':
                 op, payload = SERVO_RESET_MID, encode_servo(SERVO_RESET_MID, target_id)
             elif action == 'set_gains':
@@ -1223,11 +1394,12 @@ class Controller:
                 action_alpha_head=self.policy.action_alpha_head,
                 gyro_alpha=self.filter.gyro_alpha, velocity_alpha=self.filter.vel_alpha,
                 gravity_tau_s=self.filter.gravity_tau_s,
-                imu_bias_deg=[0., 0., 0.] if self._imu_record else list(IMU_BIAS_DEG),
+                imu_bias_deg=list(IMU_BIAS_DEG),
                 imu_acc_offset_ms2=self._imu_record['acc_offset_ms2'] if self._imu_record else [0., 0., 0.],
                 command_acc_x_bias_ms2=self.filter.command_acc_x_bias_ms2,
                 filter_clock='mcu_imu', snapshot='latest',
                 command_timeout_enabled=False, imu_stale_ms=IMU_STALE_S*1000)
+            result['stance'] = self._stance_status_locked()
             result['mcu_runtime'] = dict(self.diagnostics)
             if self.diagnostics.get('imu_period_us'):
                 result['mcu_runtime']['imu_hz'] = 1e6/self.diagnostics['imu_period_us']

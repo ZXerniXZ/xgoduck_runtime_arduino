@@ -22,7 +22,7 @@ enum ServoOp : uint8_t {
   SERVO_EXIT = 1,
   SERVO_UNLOCK = 2,
   SERVO_SET_ID = 3,
-  // 4 was the removed arbitrary-position operation.
+  SERVO_GOTO = 4, // One servo: torque on, write goal 0..4095.
   SERVO_SET_PERM_KP_KD = 5, // Legacy opcode: write and verify EEPROM + live KP/KD.
   SERVO_READ = 6,
   SERVO_PING = 7,
@@ -75,7 +75,7 @@ struct __attribute__((packed)) ServoPacket {
   char magic[4];
   uint8_t op, targetId, newId, kp, kd;
   union { uint8_t reserved; uint8_t protectionFlags; };
-  union { uint16_t reserved2; uint16_t protectionCurrent; };
+  union { uint16_t reserved2; uint16_t protectionCurrent; uint16_t rawPos; };
 };
 struct __attribute__((packed)) RawPacket {
   char magic[4];

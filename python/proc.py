@@ -28,7 +28,8 @@ class SignalFilter:
         if self.correction is not None:
             acc, gyro = self.correction.apply(acc, gyro)
             acc[0] += self.command_acc_x_bias_ms2
-            return acc, gyro
+        else:
+            acc, gyro = list(acc), list(gyro)
         return _rotate_imu_bias(acc), _rotate_imu_bias(gyro)
 
     def set_correction(self, correction):

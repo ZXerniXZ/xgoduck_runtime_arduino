@@ -49,7 +49,7 @@ static ServoPacket pendingServo = {};
 static bool servoPending = false;
 static ServoReplyPacket servoReply = {};
 static bool servoReplyReady = false;
-static uint8_t servoMidId = 0xFF, servoMidCount = 0;
+static uint8_t servoMidId = 0xFF, servoMidCount = 0, servoGotoId = 0xFF, servoSoftId = 0xFF;
 static uint32_t servoMidNextUs = 0;
 static bool rawNotifyEveryTick = false;
 
@@ -149,7 +149,7 @@ static void receiveServo(MsgPack::bin_t<uint8_t> bytes) {
   bool valid = bytes.size() == sizeof(pkt);
   if (valid) {
     memcpy(&pkt, bytes.data(), sizeof(pkt));
-    valid = memcmp(pkt.magic, "DQV2", 4) == 0 && pkt.op <= SERVO_SET_PROTECTION_CURRENT && pkt.op != 4;
+    valid = memcmp(pkt.magic, "DQV2", 4) == 0 && pkt.op <= SERVO_SET_PROTECTION_CURRENT;
     if (pkt.op == SERVO_SET_PROTECTION || pkt.op == SERVO_SET_PROTECTION_CURRENT) {
       valid = valid && pkt.targetId == 0xFE && !pkt.newId && !pkt.kp && !pkt.kd;
       if (pkt.op == SERVO_SET_PROTECTION) {
@@ -158,6 +158,9 @@ static void receiveServo(MsgPack::bin_t<uint8_t> bytes) {
       } else {
         valid = valid && !pkt.protectionFlags;
       }
+    } else if (pkt.op == SERVO_GOTO) {
+      valid = valid && pkt.targetId <= 253 && !pkt.newId && !pkt.kp && !pkt.kd &&
+              !pkt.reserved && pkt.rawPos <= POS_MAX;
     } else {
       valid = valid && pkt.targetId <= 253 && !pkt.reserved && !pkt.reserved2;
     }
@@ -199,6 +202,8 @@ static void applyCalOp(const CalPacket &pkt) {
       hostMode = HOST_CAL;
       rawNotifyEveryTick = true;
       calIndex = 0xFF;
+      servoGotoId = 0xFF;
+      servoSoftId = 0xFF;
       k_mutex_lock(&motorsMu, K_FOREVER);
       calHeldMask = 0;
       k_mutex_unlock(&motorsMu);
@@ -209,28 +214,37 @@ static void applyCalOp(const CalPacket &pkt) {
       hostMode = HOST_NORMAL;
       rawNotifyEveryTick = false;
       calIndex = 0xFF;
+      servoGotoId = 0xFF;
+      servoSoftId = 0xFF;
       k_mutex_lock(&motorsMu, K_FOREVER);
       calHeldMask = 0;
       k_mutex_unlock(&motorsMu);
       setTorqueEnable(false);
       setMouthKpKd();
       break;
-    case CAL_CENTER_ONE:
+    case CAL_CENTER_ONE: {
       if (hostMode != HOST_CAL || calIndex != 0xFF ||
           (calHeldMask & (1u << pkt.index)) || !(servoRxMask & (1u << pkt.index))) {
         publishCalReply(pkt.seq, pkt.index, false);
         break;
       }
-      scsWriteByte(MOTOR_IDS[pkt.index], ADDR_TORQUE, 0);
+      const uint8_t id = MOTOR_IDS[pkt.index];
+      if (servoGotoId == id) servoGotoId = 0xFF;
+      // Mid while the last goal is still held, then command 2048 at once.
+      // Dropping torque here lets the joint fall before the new center is saved.
+      scsWriteByte(id, ADDR_UNLOCK, 0);
+      Serial1.flush();
+      for (uint8_t n = 0; n < 3; ++n) servoMid(id);
+      setTempKpKd(id, CAL_HOLD_KP, CAL_HOLD_KD);
+      scsWriteByte(id, ADDR_TORQUE, 1);
+      writeSingleGoalRaw(id, CAL_HOLD_POS, CAL_HOLD_SPEED);
       Serial1.flush();
       k_mutex_lock(&motorsMu, K_FOREVER);
-      calHeldMask &= ~(1u << pkt.index);
+      calHeldMask |= 1u << pkt.index;
       k_mutex_unlock(&motorsMu);
-      calIndex = pkt.index;
-      calSeq = pkt.seq;
-      calMidCount = 0;
-      calNextUs = micros();
+      publishCalReply(pkt.seq, pkt.index, true);
       break;
+    }
   }
 }
 
@@ -299,6 +313,7 @@ static void applyServoOp(const ServoPacket &pkt) {
       hostMode = HOST_SERVO_DEBUG;
       rawNotifyEveryTick = true;
       servoMidId = 0xFF;
+      servoGotoId = 0xFF;
       setTorqueEnable(false);
       setMouthKpKd();
       break;
@@ -307,6 +322,7 @@ static void applyServoOp(const ServoPacket &pkt) {
       hostMode = HOST_NORMAL;
       rawNotifyEveryTick = false;
       servoMidId = 0xFF;
+      servoGotoId = 0xFF;
       setTorqueEnable(false);
       setMouthKpKd();
       break;
@@ -323,10 +339,28 @@ static void applyServoOp(const ServoPacket &pkt) {
       if (hostMode != HOST_SERVO_DEBUG || !pingServo(pkt.targetId)) { reply.ok = 0; break; }
       scsWriteByte(pkt.targetId, ADDR_TORQUE, 0);
       Serial1.flush();
+      if (servoGotoId == pkt.targetId) servoGotoId = 0xFF;
       servoMidId = pkt.targetId;
       servoMidCount = 0;
       servoMidNextUs = micros();
       return; // Reply only after all three mid commands have been sent.
+    case SERVO_GOTO:
+      if (hostMode != HOST_SERVO_DEBUG && hostMode != HOST_CAL) { reply.ok = 0; break; }
+      if (servoGotoId != 0xFF && servoGotoId != pkt.targetId) {
+        const int prev = motorIndexById(servoGotoId);
+        if (prev < 0 || !(calHeldMask & (1u << prev)))
+          scsWriteByte(servoGotoId, ADDR_TORQUE, 0);
+      }
+      if (servoSoftId != pkt.targetId) {
+        setTempKpKd(pkt.targetId, CAL_MOVE_KP, CAL_MOVE_KD);
+        servoSoftId = pkt.targetId;
+      }
+      scsWriteByte(pkt.targetId, ADDR_TORQUE, 1);
+      writeSingleGoalRaw(pkt.targetId, pkt.rawPos, CAL_MOVE_SPEED);
+      Serial1.flush();
+      servoGotoId = pkt.targetId;
+      reply.rawPos = pkt.rawPos;
+      break;
     case SERVO_SET_PERM_KP_KD: {
       if (hostMode != HOST_SERVO_DEBUG) { reply.ok = 0; break; }
       servoSetKpKd(pkt.targetId, pkt.kp, pkt.kd);
@@ -417,7 +451,7 @@ static void controlTask(void*, void*, void*) {
       // Exclusive modes retain their separate loss-of-host protection.
       hostMode = HOST_NORMAL;
       rawNotifyEveryTick = false;
-      calIndex = servoMidId = 0xFF;
+      calIndex = servoMidId = servoGotoId = 0xFF;
       k_mutex_lock(&motorsMu, K_FOREVER);
       calHeldMask = 0;
       k_mutex_unlock(&motorsMu);

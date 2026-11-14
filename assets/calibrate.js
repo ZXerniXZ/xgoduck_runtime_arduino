@@ -1,7 +1,8 @@
 const $=id=>document.getElementById(id);
 const MOTORS=[10,11,12,13,14,20,21,22,23,24,30,31,32,33,34];
 let statusBusy=false, active=false, centering=null, presentMask=0;
-let held=Array(15).fill(false);
+let held=Array(15).fill(false), moved=Array(15).fill(false), dragging=null;
+let gotoJob=null, gotoFlight=false;
 let imuCalibrationActive=false;
 
 async function post(path, body={}){
@@ -15,18 +16,43 @@ function showError(e){$('message').textContent=e.message||String(e);}
 MOTORS.forEach((id,i)=>{
   $('joints').insertAdjacentHTML('beforeend',`<div class="cal-row" id="row${i}">
     <div class="cal-meta"><b>ID ${id}</b><span id="raw${i}">Waiting for feedback</span></div>
-    <div class="cal-actions"><span id="state${i}">Unloaded</span><button data-center="${i}" disabled>Set center &amp; hold</button></div>
+    <input id="sl${i}" type="range" min="0" max="4095" value="2047" aria-label="Position ID ${id}" disabled>
+    <div class="cal-actions"><span id="val${i}">2047</span><span id="state${i}">Unloaded</span><button data-center="${i}" disabled>Set center &amp; hold</button></div>
   </div>`);
+  const sl=$(`sl${i}`);
+  sl.onpointerdown=()=>{dragging=i;};
+  sl.oninput=()=>{
+    moved[i]=true;
+    $(`val${i}`).textContent=sl.value;
+    if(active&&centering===null&&!held[i])queueGoto(i,+sl.value);
+  };
+  sl.onchange=()=>{if(dragging===i)dragging=null;};
 });
 
 function refreshRows(){
   document.querySelectorAll('[data-center]').forEach(btn=>{
     const i=+btn.dataset.center;
-    btn.disabled=!active||centering!==null||imuCalibrationActive||held[i]||!(presentMask&(1<<i));
+    const live=!!(presentMask&(1<<i));
+    const busy=centering!==null||imuCalibrationActive;
+    btn.disabled=!active||busy||held[i]||!live;
+    $(`sl${i}`).disabled=!active||busy||held[i]||!live;
     $(`row${i}`).classList.toggle('done',held[i]);
     $(`state${i}`).textContent=centering===i?'Centering…':held[i]?'Holding center':'Unloaded';
   });
   $('start').disabled=imuCalibrationActive||centering!==null;
+}
+function queueGoto(i,pos){
+  gotoJob={i,pos};
+  if(!gotoFlight)pumpGoto();
+}
+async function pumpGoto(){
+  if(gotoFlight||!gotoJob||centering!==null)return;
+  const job=gotoJob;
+  gotoJob=null;
+  gotoFlight=true;
+  try{await post('cal/goto',{index:job.i,raw_pos:job.pos});}
+  catch(e){showError(e);}
+  finally{gotoFlight=false;if(gotoJob)pumpGoto();}
 }
 
 document.querySelectorAll('[data-center]').forEach(btn=>{
@@ -49,7 +75,8 @@ async function enter(){
     await post('cal/enter');
     active=true;
     held.fill(false);
-    $('message').textContent='All servos are unloaded. Turn one joint by hand, then set its center.';
+    moved.fill(false);
+    $('message').textContent='All servos are unloaded. Place a joint with its slider, then set its center.';
     return true;
   }catch(e){showError(e);return false;}
   finally{refreshRows();}
@@ -86,7 +113,12 @@ setInterval(async()=>{
     $('mode').textContent=active?'Calibration active':'Calibration closed';
     if(s.last_error)$('message').textContent=s.last_error;
     if(s.raw_pos)s.raw_pos.forEach((v,i)=>{
-      $(`raw${i}`).textContent=presentMask&(1<<i)?'Encoder '+v:'No servo feedback';
+      const live=!!(presentMask&(1<<i));
+      $(`raw${i}`).textContent=live?'Encoder '+v:'No servo feedback';
+      if(live&&!moved[i]&&dragging!==i&&v>=0&&v<=4095){
+        $(`sl${i}`).value=v;
+        $(`val${i}`).textContent=v;
+      }
     });
     refreshRows();
   }catch(e){showError(e);}

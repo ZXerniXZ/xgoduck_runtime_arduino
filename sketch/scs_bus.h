@@ -126,12 +126,18 @@ static void sendMotorDesPos() {
   syncWriteGoalsFromDesPos();
 }
 
-static void writeSingleGoalRaw(uint8_t id, uint16_t raw) {
+static void setTempKpKd(uint8_t id, uint8_t kp, uint8_t kd) {
+  const uint8_t live[3] = {ADDR_TEMP_KP, kp, kd};
+  scsWriteBuf(id, 0x03, live, 3);
+  Serial1.flush();
+}
+
+static void writeSingleGoalRaw(uint8_t id, uint16_t raw, uint16_t speed = 0) {
   uint8_t data[7];
   data[0] = ADDR_GOAL_POS;
   packWordLE(data + 1, satPos(raw));
   packWordLE(data + 3, 0);
-  packWordLE(data + 5, 0);
+  packWordLE(data + 5, speed);
   scsWriteBuf(id, 0x03, data, 7);
 }
 

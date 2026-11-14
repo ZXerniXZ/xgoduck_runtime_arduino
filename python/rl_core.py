@@ -18,11 +18,17 @@ FEEDBACK_PERIOD = 0.01  # 100 Hz feedback and EMA reference interval.
 GRAVITY_TAU = 0.3
 
 # Static IMU attitude when the robot is standing level, in the policy body frame
-# (degrees). Stand still and read grav: pitch = atan2(gx, -gz), roll = atan2(-gy, -gz).
+# (degrees). Stand still and read gravity before this rotation:
+# pitch = atan2(gx, -gz), roll = atan2(-gy, -gz).
 # Those values go here; both accelerometer and gyro are rotated so standing gravity
 # becomes [0, 0, -1]. Yaw is unobservable from gravity; leave it 0 unless the board
 # is also twisted. Example: pitch inherently 5° → (0.0, 5.0, 0.0).
-IMU_BIAS_DEG = (0.0, 0.0, 0.0)  # roll, pitch, yaw
+# Factory value, measured in the original Default pose on 2026-11-13:
+# grav [-0.174, -0.014, -0.985], pitch = atan2(gx, -gz) = -10°.
+# The list is mutated when a new pose captures its own reference. The tuple stays
+# the factory pair that belongs to DEFAULT_DEG.
+FACTORY_IMU_BIAS_DEG = (0.0, -10.0, 0.0)  # roll, pitch, yaw
+IMU_BIAS_DEG = [0.0, -10.0, 0.0]
 
 MOTOR_IDS = [
     10, 11, 12, 13, 14,
@@ -76,11 +82,40 @@ class State:
     grav: List[float] = field(default_factory=lambda: [0.0, 0.0, -1.0])
     gyro_rad: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
 
+def set_imu_bias(roll, pitch, yaw=0.0):
+    """Replace the live attitude reference. Roll and pitch come from a still pose."""
+    values = []
+    for name, value in (('roll', roll), ('pitch', pitch), ('yaw', yaw)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f'{name} must be a number')
+        value = float(value)
+        if not math.isfinite(value) or abs(value) > 45.0:
+            raise ValueError(f'{name} must stay within ±45°')
+        values.append(value)
+    IMU_BIAS_DEG[:] = values
+    return tuple(IMU_BIAS_DEG)
+
+
+def restore_factory_imu_bias():
+    IMU_BIAS_DEG[:] = FACTORY_IMU_BIAS_DEG
+    return tuple(IMU_BIAS_DEG)
+
+
+def gravity_attitude_deg(grav):
+    """Roll and pitch of a policy-frame gravity vector, before the stance rotation."""
+    gx, gy, gz = (float(v) for v in grav)
+    if not all(math.isfinite(v) for v in (gx, gy, gz)):
+        raise ValueError('Gravity reading is not usable.')
+    if math.sqrt(gx * gx + gy * gy + gz * gz) < 0.5:
+        raise ValueError('Gravity reading is not usable.')
+    return math.degrees(math.atan2(-gy, -gz)), math.degrees(math.atan2(gx, -gz))
+
+
 def _rotate_imu_bias(vec: List[float]) -> List[float]:
     """Rotate an IMU vector to cancel IMU_BIAS_DEG. Identity when the bias is zero."""
     roll, pitch, yaw = IMU_BIAS_DEG
     if roll == 0.0 and pitch == 0.0 and yaw == 0.0:
-        return vec
+        return list(vec)
     r, p, y = math.radians(roll), math.radians(pitch), math.radians(yaw)
     x, yv, z = vec
     if y:
@@ -92,6 +127,25 @@ def _rotate_imu_bias(vec: List[float]) -> List[float]:
     if p:
         cp, sp = math.cos(p), math.sin(p)
         x, z = x * cp + z * sp, -x * sp + z * cp
+    return [x, yv, z]
+
+
+def _unrotate_imu_bias(vec: List[float]) -> List[float]:
+    """Inverse of _rotate_imu_bias. Recovers gravity as measured before the stance rotation."""
+    roll, pitch, yaw = IMU_BIAS_DEG
+    if roll == 0.0 and pitch == 0.0 and yaw == 0.0:
+        return list(vec)
+    r, p, y = math.radians(roll), math.radians(pitch), math.radians(yaw)
+    x, yv, z = vec
+    if p:
+        cp, sp = math.cos(p), math.sin(p)
+        x, z = x * cp - z * sp, x * sp + z * cp
+    if r:
+        cr, sr = math.cos(r), math.sin(r)
+        yv, z = yv * cr + z * sr, -yv * sr + z * cr
+    if y:
+        cy, sy = math.cos(y), math.sin(y)
+        x, yv = x * cy + yv * sy, -x * sy + yv * cy
     return [x, yv, z]
 
 

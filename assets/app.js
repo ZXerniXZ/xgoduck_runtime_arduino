@@ -7,6 +7,7 @@ let imuCalibrationActive=false, imuCalibrationBusy=false, imuCalibrationError=''
 let imuState=null, controlModeAvailable=true;
 let actionPreparing=false;
 let headingBusy=false;
+let stanceBusy=false, stanceDirty=false, stanceBuilt=false;
 const motionRanges={
   walk:{forward:.2,backward:.2,strafe:.3,yaw:1,keyboard:[.2,.15,.5]},
   roller:{forward:.4,backward:.4,strafe:0,yaw:.45,keyboard:[.4,0,.45]}
@@ -19,6 +20,84 @@ function showPreparation(active){
 }
 async function post(path, body){const r=await fetch('/api/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const x=await r.json();if(!r.ok)throw new Error(x.detail||'request failed');if(x.preparing)showPreparation(true);return x;}
 function showError(e){$('message').textContent=e.message;}
+function ensureStance(joints){
+  if(stanceBuilt||!joints?.length)return;
+  joints.forEach((joint,i)=>{
+    const label=document.createElement('label');
+    label.textContent=`${joint.name} · ID ${joint.id}`;
+    const input=document.createElement('input');
+    input.type='number';input.step='0.5';input.min='-60';input.max='60';input.id=`stance${i}`;
+    input.addEventListener('input',()=>{stanceDirty=true;});
+    label.append(input);
+    $('stance-joints').append(label);
+  });
+  stanceBuilt=true;
+}
+function stanceValues(){
+  return [...document.querySelectorAll('#stance-joints input')].map(input=>{
+    if(input.value.trim()==='')throw new Error('Enter all 14 joint degrees.');
+    const value=Number(input.value);
+    if(!Number.isFinite(value)||value<-60||value>60)throw new Error('Each joint must stay within ±60°.');
+    return value;
+  });
+}
+function fillStance(home){
+  home.forEach((value,i)=>{$('stance'+i).value=Number(value).toFixed(1);});
+  stanceDirty=false;
+}
+function showStance(s){
+  const stance=s.stance;
+  if(!stance)return;
+  ensureStance(stance.joints);
+  const editing=[...document.querySelectorAll('#stance-joints input')].some(input=>input===document.activeElement);
+  if(stanceBuilt&&!stanceDirty&&!editing&&!stanceBusy)fillStance(stance.home_deg);
+  const bias=stance.imu_bias_deg||[0,0,0];
+  $('stance-bias').textContent=`Gravity reference: roll ${Number(bias[0]).toFixed(2)}° · pitch ${Number(bias[1]).toFixed(2)}°`;
+  const blocked=stanceBusy||s.mode==='policy'||s.roller?.enabled||s.pick?.active||s.roulade?.active||s.sitstand?.active||s.left_kick?.active||s.right_kick?.active||s.action_preparation?.active||['calibrate','servo_debug'].includes(s.mode);
+  $('stance-save').disabled=blocked;
+  $('stance-reset').disabled=blocked;
+  $('stance-capture').disabled=blocked||s.mode!=='hold';
+  if(!stanceBusy && !$('stance-status').classList.contains('error') && !$('stance-status').textContent){
+    $('stance-status').textContent=stance.message||'';
+  }
+}
+function showStanceError(e){
+  $('stance-status').classList.add('error');
+  $('stance-status').textContent=e.message;
+}
+$('stance-save').onclick=async()=>{
+  if(stanceBusy)return;
+  stanceBusy=true;
+  try{
+    const saved=await post('stance',{home_deg:stanceValues()});
+    fillStance(saved.home_deg);
+    $('stance-status').classList.remove('error');
+    $('stance-status').textContent=saved.message||'Standing pose saved.';
+  }catch(e){showStanceError(e);}
+  finally{stanceBusy=false;}
+};
+$('stance-reset').onclick=async()=>{
+  if(stanceBusy)return;
+  stanceBusy=true;
+  try{
+    const saved=await post('stance',{reset:true});
+    fillStance(saved.home_deg);
+    $('stance-status').classList.remove('error');
+    $('stance-status').textContent=saved.message||'Standing pose reset.';
+  }catch(e){showStanceError(e);}
+  finally{stanceBusy=false;}
+};
+$('stance-capture').onclick=async()=>{
+  if(stanceBusy)return;
+  stanceBusy=true;
+  $('stance-status').classList.remove('error');
+  $('stance-status').textContent='Hold the body still. Capturing gravity…';
+  try{
+    const saved=await post('stance',{capture:true});
+    $('stance-status').textContent=saved.message||'Gravity reference captured.';
+  }catch(e){showStanceError(e);}
+  finally{stanceBusy=false;}
+};
 function showHeading(h){
   if(!h)return;
   $('heading-hold').checked=h.enabled;$('heading-state').textContent=h.enabled?'On':'Off';
@@ -220,6 +299,7 @@ imuReady=!!s.imu_ok&&s.feedback_age_ms!=null&&s.feedback_age_ms<150;
 document.querySelectorAll('[data-mode="hold"],[data-mode="policy"]').forEach(b=>b.disabled=!s.control_ready);
 if(s.roller&&!rollerBusy)showRoller(s.roller.enabled);
 if(!rollerBusy)showActionSettings(s.deployment);
+showStance(s);
 imuFilters.forEach(([id,key])=>{if(document.activeElement!==$(id)){$(id).value=s.deployment[key];$(id+'-value').textContent=(+$(id).value).toFixed(2);}});
 const recovery=s.recovery, pick=s.pick, roulade=s.roulade, sitstand=s.sitstand, rightKick=s.right_kick;
 showPreparation(s.action_preparation?.active);

@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>XGO Duck</title><link rel="stylesheet" href="style.css?v=20261105-imu-calibration2">
+<title>XGO Duck</title><link rel="stylesheet" href="style.css?v=20261113-stance">
 <main>
 <header><div><small>ARDUINO UNO Q</small><h1>XGO Duck</h1></div><div class="header-actions"><nav class="nav"><a href="/" aria-current="page">Control</a><a href="/calibrate.html">Calibration</a><a href="/servo.html">Servo setup</a></nav><button class="stop" id="stop">Torque off</button></div></header>
 <p id="message">Connecting…</p>
@@ -9,6 +9,14 @@
   <h2>Mode <span id="mode">—</span></h2>
   <div class="buttons"><button data-mode="shadow">Inference only</button><button data-mode="hold">Default pose</button><button data-mode="policy">Walk / get up</button><button id="pick">Pick</button><button id="roulade">Roulade</button><button id="sitstand" disabled>Sit</button><button id="left_kick" disabled>Left kick</button><button id="right_kick" disabled>Right kick</button><label class="mode-toggle"><input id="roller-mode" type="checkbox" role="switch">Skating mode <span id="roller-state">Off</span></label></div>
   <p class="hint">Default pose holds a standing pose. Walk / get up walks and recovers after a fall. Choose Pick, Roulade, Sit/Stand or a kick to perform that action. Enable Skating mode for skating. Inference only previews motion; Torque off releases the motors.</p>
+</section>
+<section>
+  <h2>Standing pose</h2>
+  <div class="stance-grid" id="stance-joints"></div>
+  <p class="joy-value" id="stance-bias">Gravity reference —</p>
+  <div class="buttons"><button id="stance-save" disabled>Save stance</button><button id="stance-reset" disabled>Reset stance</button><button id="stance-capture" disabled>Capture gravity</button></div>
+  <p class="hint">These 14 degrees are the walking home. Save moves the body while Default pose is held. To shift the body forward, make left hip pitch (ID 12) more negative and left ankle (ID 14) more positive, and mirror IDs 22 and 24. Reset restores the measured stance: hips ±26.2°, ankles ±18°, gravity reference roll 1.64° and pitch 2.19°.</p>
+  <p id="stance-status" role="status"></p>
 </section>
 <section>
   <h2>Motion</h2>
@@ -47,4 +55,4 @@
     </figure>
   </div>
 </section>
-</main><script src="app.js?v=20261106-heading-hold2"></script></html>
+</main><script src="app.js?v=20261113-stance"></script></html>
