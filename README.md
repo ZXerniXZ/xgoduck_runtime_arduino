@@ -22,16 +22,54 @@ sudo bash tools/router-2m.sh
 
 Then click **Run** in App Lab. Repeat this preparation if the board's library cache is replaced. It configures the 2 Mbps connection required by this app.
 
-Connect the servo bus to **D0/D1** and the QMI8658 IMU to **D20/D21**.
+Connect the servo bus to **D0/D1** and the MPU-6000 as in [This duck](#this-duck).
 
-The STM32 runs independent 100 Hz servo and IMU threads. IMU initialization and
-I²C retries do not block the servo watchdog. Feedback uses the latest complete
-snapshots, and Linux integrates IMU samples using their MCU timestamps.
+The STM32 runs independent 100 Hz servo and IMU threads. IMU startup does not
+block the servo watchdog. Feedback uses the latest complete snapshots, and
+Linux integrates IMU samples using their MCU timestamps.
 
 `tools/prepare-bridge.py` also installs bounded RPC waits and retry-safe Bridge
 initialization for the pinned libraries. Initialization retries use backoff;
 reconnection leaves the robot unloaded until motion is explicitly enabled again.
 `/api/status` includes `mcu_runtime` diagnostics for both loops and Bridge retries.
+
+## This duck
+
+This branch drives a Feetech HD-1910 duck with an MPU-6000 on the back. It is not the official QMI8658 carrier.
+
+### Servo bus
+
+The bus is a Waveshare Bus Servo Adapter (A). Jumper **A** connects the UART header to the Uno Q. Jumper **B** connects the same bus to the adapter USB port instead, so a computer can read the servos while the Uno Q UART is disconnected. The two positions are exclusive.
+
+UART wiring is same-name, at 3.3 V: adapter **RX** to Uno Q **D0** (`USART1` RX), adapter **TX** to **D1** (`USART1` TX), and a common GND. Servo power is the adapter DC jack. The adapter USB-C socket powers only the adapter logic.
+
+`Serial1` runs at 1 Mbps. The adapter turns its bus driver on from the host TX edge and does not echo that TX back to RX, so the sketch never treats its own bytes as a reply. Present state is a 7-byte read at `0x38`: position, speed, load, then voltage in 0.1 V (`PRESENT_LEN` in `sketch/duck_config.h`). A reply is accepted only after the checksum. One shorted branch holds the single half-duplex line and silences every ID.
+
+### Accelerometer and gyro
+
+The IMU is an InvenSense MPU-6000, fixed on the duck's back with the board face up. It is not a QMI8658 and not an I2C MPU-6050. Wiring: 5 V to 5 V, GND to GND, SCK to D13, MISO to D12, MOSI to D11, CS to D10. INT on D2 is unused. The module VCC is 5 V; the die and the SPI pins stay at 3.3 V.
+
+SPI is bit-banged in mode 3. The Zephyr SPI driver shares the TX and RX buffer, so a hardware multi-byte write clocks zeros. `WHO_AM_I` (`0x75`) must read `0x68`.
+
+The gyro full-scale write (`GYRO_CONFIG` `0x10`, ±1000 °/s) does not stick. The chip stays at its power-up range, ±250 °/s, 131 LSB/°/s. `mpuGyro` in `sketch/qmi8658.h` converts those counts into the 32 LSB/°/s units the rest of the stack expects. Rates past ±250 °/s clip. The accelerometer stays at ±2 g, 16384 LSB/g.
+
+With the board face up on the back, the firmware maps the chip axes into the body frame. Acceleration `(ax, ay, az)` becomes `(az, −ax, ay)`. Gyro `(gx, gy, gz)` becomes `(−gz, gx, −gy)`. Standing gravity in that frame is `[0, 0, −1]`. Positive gravity X is beak down. Positive gravity Y is left side down.
+
+### Measured standing pose
+
+Reset on the Control page restores the stance measured on this duck, not the factory ±22° pose and not a −10° pitch bias. The values live in `python/stance.py`:
+
+| | Left | Right |
+| --- | --- | --- |
+| Hip yaw | 0° | 0° |
+| Hip roll | −5° | +5° |
+| Hip pitch | −26.24° | +26.24° |
+| Knee | −0.28° | +0.28° |
+| Ankle | +18° | −18° |
+
+Neck pitch and head pitch are +20°. Head yaw and head roll are 0°.
+
+The gravity reference saved with that pose is roll **+1.641°**, pitch **+2.185°**, yaw 0 (`BASELINE_IMU_BIAS_DEG`). It is the still capture taken while the duck was standing in this pose, so it removes both the mount error and whatever trunk pitch that pose actually had. Walk uses this pair. Get-up keeps the factory home, ±22°, and does not read `stance.json`.
 
 ## Servo setup
 
